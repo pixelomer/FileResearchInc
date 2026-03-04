@@ -122,6 +122,7 @@ export async function upload(key: bigint, path: string) {
                     if (actualBitData == null) {
                         set.add(bitIndex);
                         await sleep(10000);
+                        promises.splice(promises.indexOf(promise), 1);
                         --activeDownloads;
                         return;
                     }
