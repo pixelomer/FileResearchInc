@@ -28,7 +28,7 @@ const UPLOAD_BIT_FLIP_GAP = 20;
 
 // Configures the amount of time (in ms) to sleep before continuing after
 // receiving an error response from the server.
-const RATE_LIMIT_DURATION = 3000;
+const RATE_LIMIT_DURATION = 10000;
 
 export interface BitData {
     value: 0 | 1,
