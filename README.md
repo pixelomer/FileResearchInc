@@ -13,4 +13,4 @@ End-of-file is indicated by a bit that was written more than 60 seconds after th
 
 ## Future Research
 
-We believe that it may be possible to open real-time Transmission Control Protocols (TCP) tunnels between different terminals using the `search_count` field in API responses.
+We believe that it may be possible to open real-time Transmission Control Protocol (TCP) tunnels between different terminals using the `search_count` field in API responses.
