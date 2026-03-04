@@ -1,15 +1,18 @@
 // Number of seconds for a bit window.
 //
-// The result of dividing 60 by this number must be an even number.
+// The result of dividing 3600 by this number should be an even number.
 // If you change this number while uploading, you must also use the
 // same value for downloading.
-const BIT_WINDOW = 30;
+const BIT_WINDOW = 120;
 
 // Maximum number of connections during upload.
 //
 // Higher number means more bits per second, but also higher risk of
 // unintentional bit flips and rate limit errors.
 const UPLOAD_CONNECTION_COUNT = 8;
+
+// Maximum number of connections during download.
+const DOWNLOAD_CONNECTION_COUNT = 8;
 
 // Number of seconds to wait between BIT_WINDOW-second upload windows.
 // 
@@ -21,7 +24,7 @@ const UPLOAD_CONNECTION_COUNT = 8;
 // number is safer but slower. A lower number is faster but more likely to cause
 // corruption. This number must be in the range [0, BIT_WINDOW-1]. A higher number
 // is recommended if the server is slow at responding due to high load.
-const UPLOAD_BIT_FLIP_GAP = 10;
+const UPLOAD_BIT_FLIP_GAP = 20;
 
 // Configures the amount of time (in ms) to sleep before continuing after
 // receiving an error response from the server.
@@ -46,8 +49,15 @@ export function keygen(): bigint {
     return val;
 }
 
-export function bitForDate(date: Date): 0 | 1 {
-    return (date.getUTCSeconds() % (BIT_WINDOW * 2) >= BIT_WINDOW) ? 1 : 0;
+export function getTime(date?: Date): number {
+    if (date == null) {
+        date = new Date();
+    }
+    return date.getUTCMinutes() * 60 + date.getUTCSeconds();
+}
+
+export function bitForDate(date?: Date): 0 | 1 {
+    return (getTime(date) % (BIT_WINDOW * 2) >= BIT_WINDOW) ? 1 : 0;
 }
 
 export function currentBit(): 0 | 1 {
@@ -59,8 +69,7 @@ function sleep(ms: number) {
 }
 
 export function isSafeToWrite() {
-    const date = new Date();
-    return date.getUTCSeconds() % BIT_WINDOW <= (BIT_WINDOW - UPLOAD_BIT_FLIP_GAP - 1);
+    return getTime() % BIT_WINDOW <= (BIT_WINDOW - UPLOAD_BIT_FLIP_GAP - 1);
 }
 
 export async function waitUntilSafeWrite() {
@@ -69,7 +78,7 @@ export async function waitUntilSafeWrite() {
     }
 }
 
-export async function fetchBit(id: bigint): Promise<BitData | null> {
+export async function tryFetchBit(id: bigint): Promise<BitData | null> {
     let bit: number | null = null;
     let date: Date | null = null;
     let isNew: boolean | null = null;
@@ -105,6 +114,17 @@ export async function fetchBit(id: bigint): Promise<BitData | null> {
     return { value: bit as (0 | 1), date: date!, isNew: isNew! };
 }
 
+export async function fetchBit(id: bigint): Promise<BitData> {
+    let data: BitData | null = null;
+    while (data == null) {
+        data = await tryFetchBit(id);
+        if (data == null) {
+            await sleep(RATE_LIMIT_DURATION);
+        }
+    }
+    return data;
+}
+
 export async function upload(key: bigint, path: string) {
     const base = key << 32n;
     const file = await Deno.open(path, { read: true });
@@ -122,7 +142,7 @@ export async function upload(key: bigint, path: string) {
             date.getUTCSeconds().toString().padStart(2, "0");
         const text = `\rwrote ${wrote} bits (= ${(wrote/8).toFixed(3)} bytes, ` +
             `${activeDownloads} conns, ${errors} errors, ${timestamp}, ` +
-            `safe? ${isSafeToWrite() ? "yes": " no"})`
+            `bit ${currentBit()}, safe? ${isSafeToWrite() ? "yes": " no"})`
         await Deno.stderr.write(new TextEncoder().encode(text));
     };
     const interval = setInterval(intervalCb, 250);
@@ -149,7 +169,7 @@ export async function upload(key: bigint, path: string) {
                     const bitIndex = set.values().next().value as number;
                     set.delete(bitIndex);
                     ++activeDownloads;
-                    const actualBitData = await fetchBit(base + BigInt(bitIndex));
+                    const actualBitData = await tryFetchBit(base + BigInt(bitIndex));
                     if (actualBitData == null) {
                         set.add(bitIndex);
                         await sleep(RATE_LIMIT_DURATION);
@@ -182,53 +202,47 @@ export async function upload(key: bigint, path: string) {
     clearInterval(interval);
     await intervalCb();
     console.error();
+    
+    // upload completion timestamp
+    await fetchBit(base-1n);
 }
 
 export async function download(key: bigint, writable: WritableStream) {
     const base = key << 32n;
     const promises: Promise<void>[] = [];
     const writer = writable.getWriter();
-    let lastTimestamp: Date | null = null;
-    let done = false;
     let bitCount = 0;
+    let lastIndex = Number.MAX_SAFE_INTEGER;
     const intervalCb = async() => {
         const text = `\rread ${bitCount} bits (= ${(bitCount/8).toFixed(3)} bytes)`
         await Deno.stderr.write(new TextEncoder().encode(text));
     };
     const interval = setInterval(intervalCb, 250);
-    for (let i=0; !done; ++i) {
-        let byte = 0;
-        for (let j=0; j<8; ++j) {
-            const cb = async(): Promise<void> => {
-                let bit: BitData | null = null;
-                while (bit == null) {
-                    bit = await fetchBit(base + BigInt(i)*8n + BigInt(j));
-                    if (bit == null) {
-                        await sleep(RATE_LIMIT_DURATION);
-                    }
+    const completionTimestamp = (await fetchBit(base-1n)).date;
+    const data: number[] = [];
+    for (let i=0; i<lastIndex; ++i) {
+        const cb = async(): Promise<void> => {
+            const bit = await fetchBit(base + BigInt(i));
+            if (bit.date.valueOf() > completionTimestamp.valueOf() || bit.isNew) {
+                lastIndex = Math.min(lastIndex, i);
+            }
+            else {
+                if (data[Math.floor(i / 8)] == null) {
+                    data[Math.floor(i / 8)] = 0;
                 }
-                if (j == 0) {
-                    if (lastTimestamp != null) {
-                        if (bit.date.valueOf() - lastTimestamp.valueOf() > 60000) {
-                            done = true;
-                        }
-                    }
-                    if (bit.isNew) {
-                        done = true;
-                    }
-                    lastTimestamp = bit.date;
-                }
-                byte |= bit.value << j;
+                data[Math.floor(i / 8)] |= bit.value << (i % 8);
                 ++bitCount;
-            };
-            promises.push(cb());
-        }
-        await Promise.all(promises);
-        promises.length = 0;
-        if (!done) {
-            await writer.write(new Uint8Array([ byte ]));
+                promises.splice(promises.indexOf(promise), 1);
+            }
+        };
+        const promise = cb();
+        promises.push(promise);
+        if (promises.length >= DOWNLOAD_CONNECTION_COUNT) {
+            await Promise.any([...promises]);
         }
     }
+    await Promise.all([...promises]);
+    await writer.write(new Uint8Array(data));
     writer.close();
     clearInterval(interval);
     await intervalCb();
