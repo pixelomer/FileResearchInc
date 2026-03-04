@@ -1,0 +1,7 @@
+*
+!.gitattributes
+!.gitignore
+!download.ts
+!mod.ts
+!README.md
+!upload.ts
