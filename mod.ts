@@ -94,8 +94,10 @@ export async function tryFetchBit(id: bigint): Promise<BitData | null> {
             });
             const json = await res.json();
             if (!res.ok) {
-                console.error("\nHTTP", res.status);
-                console.error(json);
+                if (res.status !== 429) {
+                    console.error("\nHTTP", res.status);
+                    console.error(json);
+                }
             }
             else {
                 date = new Date(json.discovered_at);
