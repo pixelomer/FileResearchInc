@@ -23,6 +23,10 @@ const UPLOAD_CONNECTION_COUNT = 8;
 // is recommended if the server is slow at responding due to high load.
 const UPLOAD_BIT_FLIP_GAP = 10;
 
+// Configures the amount of time (in ms) to sleep before continuing after
+// receiving an error response from the server.
+const RATE_LIMIT_DURATION = 3000;
+
 export interface BitData {
     value: 0 | 1,
     date: Date,
@@ -146,7 +150,7 @@ export async function upload(key: bigint, path: string) {
                     const actualBitData = await fetchBit(base + BigInt(bitIndex));
                     if (actualBitData == null) {
                         set.add(bitIndex);
-                        await sleep(10000);
+                        await sleep(RATE_LIMIT_DURATION);
                         promises.splice(promises.indexOf(promise), 1);
                         --activeDownloads;
                         return;
@@ -197,7 +201,7 @@ export async function download(key: bigint, writable: WritableStream) {
                 while (bit == null) {
                     bit = await fetchBit(base + BigInt(i)*8n + BigInt(j));
                     if (bit == null) {
-                        await sleep(10000);
+                        await sleep(RATE_LIMIT_DURATION);
                     }
                 }
                 if (j == 0) {
