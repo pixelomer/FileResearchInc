@@ -1,3 +1,22 @@
+// Maximum number of connections during upload.
+//
+// Higher number means more bits per second, but also higher risk of
+// unintentional bit flips and rate limit errors.
+const UPLOAD_CONNECTION_COUNT = 4;
+
+// Number of seconds to wait between 10-second upload windows.
+// 
+// Uploading works by continuously switching between writing ones and
+// writing zeroes every 10 seconds. Writing a bit towards the end of a
+// 10 second window carries the risk of permanently writing an incorrect
+// bit and corrupting the upload. This option configures how many seconds
+// the script should wait before switching from writing ones/zeroes to
+// zeroes/ones. A higher number is safer but slower. A lower number is
+// faster but more likely to cause corruption. This number must be in the
+// range [0, 9]. A higher number is recommended if the server is slow at
+// responding due to high load.
+const UPLOAD_BIT_FLIP_GAP = 6;
+
 export interface BitData {
     value: 0 | 1,
     date: Date,
@@ -31,7 +50,7 @@ function sleep(ms: number) {
 
 export function isSafeToWrite() {
     const date = new Date();
-    return date.getUTCSeconds() % 10 <= 3;
+    return date.getUTCSeconds() % 10 <= (9 - UPLOAD_BIT_FLIP_GAP);
 }
 
 export async function waitUntilSafeWrite() {
@@ -141,7 +160,7 @@ export async function upload(key: bigint, path: string) {
             };
             const promise = cb();
             promises.push(promise);
-            if (promises.length >= 4) {
+            if (promises.length >= UPLOAD_CONNECTION_COUNT) {
                 await Promise.any([...promises]);
             }
         }
