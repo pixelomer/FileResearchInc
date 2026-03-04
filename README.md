@@ -9,7 +9,7 @@ We use the technology created by [Number Research Inc.](https://numberresearch.x
 3. If the current second mod 20 is greater than or equal to 10, write the 1 bits of the file at (BASE + i). Otherwise, write the 0 bits of the file at (BASE + i). i refers to the index of a given bit in the file. Continue until all bits have been written.
 4. When reading a file back, request all of the numbers associated with the file sequentially and check their timestamps to derive the original bits.
 
-End-of-file is indicated by a bit that was written more than 60 seconds after the previous bit, so make sure you don't lose your connection while uploading a large file!
+After the upload is completed, the number before the first bit is used to mark the final timestamp of the file. While downloading, this timestamp is checked to ensure that no bits past the end of the file are written to disk.
 
 ## Future Research
 
