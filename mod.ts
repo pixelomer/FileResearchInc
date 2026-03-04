@@ -113,6 +113,7 @@ export async function upload(key: bigint, path: string) {
     let bitId = 0;
     let wrote = 0;
     let activeDownloads = 0;
+    let errors = 0;
     const promises: Promise<void>[] = [];
     const intervalCb = async() => {
         const date = new Date();
@@ -120,7 +121,8 @@ export async function upload(key: bigint, path: string) {
             date.getUTCMinutes().toString().padStart(2, "0") + ":" +
             date.getUTCSeconds().toString().padStart(2, "0");
         const text = `\rwrote ${wrote} bits (= ${(wrote/8).toFixed(3)} bytes, ` +
-            `${activeDownloads} conns, ${timestamp}, safe? ${isSafeToWrite() ? "yes": " no"})`
+            `${activeDownloads} conns, ${errors} errors, ${timestamp}, ` +
+            `safe? ${isSafeToWrite() ? "yes": " no"})`
         await Deno.stderr.write(new TextEncoder().encode(text));
     };
     const interval = setInterval(intervalCb, 250);
@@ -157,8 +159,9 @@ export async function upload(key: bigint, path: string) {
                     }
                     const actualBit = actualBitData.value;
                     if (actualBit !== bit) {
-                        console.error("\nERROR: bit id", bitIndex);
-                        console.error("ERROR: tried to write", bit, "but wrote", actualBit);
+                        console.error(`ERROR: for bit ${bitIndex}, tried to write ` +
+                            `${bit} but wrote ${actualBit}`);
+                        ++errors;
                     }
                     ++wrote;
                     --activeDownloads;
