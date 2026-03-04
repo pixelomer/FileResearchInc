@@ -15,13 +15,12 @@ const UPLOAD_CONNECTION_COUNT = 8;
 // 
 // Uploading works by continuously switching between writing ones and
 // writing zeroes every BIT_WINDOW seconds. Writing a bit towards the end of a
-// 10 second window carries the risk of permanently writing an incorrect
-// bit and corrupting the upload. This option configures how many seconds
-// the script should wait before switching from writing ones/zeroes to
-// zeroes/ones. A higher number is safer but slower. A lower number is
-// faster but more likely to cause corruption. This number must be in the
-// range [0, BIT_WINDOW-1]. A higher number is recommended if the server is slow at
-// responding due to high load.
+// bit window carries the risk of permanently writing an incorrect bit and
+// corrupting the upload. This option configures how many seconds the script
+// should wait before switching from writing ones/zeroes to zeroes/ones. A higher
+// number is safer but slower. A lower number is faster but more likely to cause
+// corruption. This number must be in the range [0, BIT_WINDOW-1]. A higher number
+// is recommended if the server is slow at responding due to high load.
 const UPLOAD_BIT_FLIP_GAP = 10;
 
 export interface BitData {
