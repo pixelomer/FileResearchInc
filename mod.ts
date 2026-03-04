@@ -1,6 +1,6 @@
 // Number of seconds for a bit window.
 //
-// The result of dividing this number by 60 must be an even number.
+// The result of dividing 60 by this number must be an even number.
 // If you change this number while uploading, you must also use the
 // same value for downloading.
 const BIT_WINDOW = 30;
