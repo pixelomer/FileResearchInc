@@ -12,3 +12,4 @@ if (path == null) {
 const key = FileResearchInc.keygen();
 console.error("uploading with key:", key.toString(16).toUpperCase());
 await FileResearchInc.upload(key, path);
+console.error("upload completed:", key.toString(16).toUpperCase());
