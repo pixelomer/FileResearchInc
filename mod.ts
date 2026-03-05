@@ -1,37 +1,25 @@
-// Number of seconds for a bit window.
-//
-// The result of dividing 3600 by this number should be an even number.
-// If you change this number while uploading, you must also use the
-// same value for downloading.
-const BIT_WINDOW = 120;
+// Number of seconds for a nibble window.
+const NIBBLE_WINDOW = 20;
 
-// Maximum number of connections during upload.
-//
-// Higher number means more bits per second, but also higher risk of
-// unintentional bit flips and rate limit errors.
+// Maximum number of connections during upload. Higher number means
+// more nibbles per second, but also higher risk of corruption and
+// rate limit errors.
 const UPLOAD_CONNECTION_COUNT = 8;
 
 // Maximum number of connections during download.
 const DOWNLOAD_CONNECTION_COUNT = 8;
 
-// Number of seconds to wait between BIT_WINDOW-second upload windows.
-// 
-// Uploading works by continuously switching between writing ones and
-// writing zeroes every BIT_WINDOW seconds. Writing a bit towards the end of a
-// bit window carries the risk of permanently writing an incorrect bit and
-// corrupting the upload. This option configures how many seconds the script
-// should wait before switching from writing ones/zeroes to zeroes/ones. A higher
-// number is safer but slower. A lower number is faster but more likely to cause
-// corruption. This number must be in the range [0, BIT_WINDOW-1]. A higher number
-// is recommended if the server is slow at responding due to high load.
-const UPLOAD_BIT_FLIP_GAP = 20;
+// Number of seconds to sleep towards the end of each upload window.
+const UPLOAD_WINDOW_GAP = 5;
 
 // Configures the amount of time (in ms) to sleep before continuing after
 // receiving an error response from the server.
-const RATE_LIMIT_DURATION = 10000;
+const RATE_LIMIT_DURATION = 15000;
 
-export interface BitData {
-    value: 0 | 1,
+export type Nibble = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15;
+
+export interface NibbleData {
+    value: Nibble,
     date: Date,
     isNew: boolean
 };
@@ -53,15 +41,15 @@ export function getTime(date?: Date): number {
     if (date == null) {
         date = new Date();
     }
-    return date.getUTCMinutes() * 60 + date.getUTCSeconds();
+    return date.getUTCHours() * 3600 + date.getUTCMinutes() * 60 + date.getUTCSeconds();
 }
 
-export function bitForDate(date?: Date): 0 | 1 {
-    return (getTime(date) % (BIT_WINDOW * 2) >= BIT_WINDOW) ? 1 : 0;
+export function nibbleForDate(date?: Date): Nibble {
+    return Math.floor((getTime(date) % (NIBBLE_WINDOW * 16)) / NIBBLE_WINDOW) as Nibble;
 }
 
-export function currentBit(): 0 | 1 {
-    return bitForDate(new Date());
+export function currentNibble(): Nibble {
+    return nibbleForDate(new Date());
 }
 
 function sleep(ms: number) {
@@ -69,7 +57,7 @@ function sleep(ms: number) {
 }
 
 export function isSafeToWrite() {
-    return getTime() % BIT_WINDOW <= (BIT_WINDOW - UPLOAD_BIT_FLIP_GAP - 1);
+    return getTime() % NIBBLE_WINDOW <= (NIBBLE_WINDOW - UPLOAD_WINDOW_GAP - 1);
 }
 
 export async function waitUntilSafeWrite() {
@@ -78,48 +66,43 @@ export async function waitUntilSafeWrite() {
     }
 }
 
-export async function tryFetchBit(id: bigint): Promise<BitData | null> {
-    let bit: number | null = null;
-    let date: Date | null = null;
-    let isNew: boolean | null = null;
-    //console.log("fetching bit:", id);
-    while (bit == null) {
-        try {
-            const res = await fetch("https://numberresearch.xyz/api/check", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ number: id.toString() })
-            });
-            const json = await res.json();
-            if (!res.ok) {
-                if (res.status !== 429) {
-                    console.error("\nHTTP", res.status);
-                    console.error(json);
-                }
-            }
-            else {
-                date = new Date(json.discovered_at);
-                bit = bitForDate(date);
-                isNew = json.is_new;
+export async function tryFetchNibble(id: bigint): Promise<NibbleData | null> {
+    const data = {} as NibbleData;
+    try {
+        const res = await fetch("https://numberresearch.xyz/api/check", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ number: id.toString() })
+        });
+        const json = await res.json();
+        if (!res.ok) {
+            if (res.status !== 429) {
+                console.error("\nHTTP", res.status);
+                console.error(json);
             }
         }
-        catch (err) {
-            console.error();
-            console.error(err);
-        }
-        if (bit == null) {
-            return null;
+        else {
+            data.date = new Date(json.discovered_at);
+            data.value = nibbleForDate(data.date);
+            data.isNew = json.is_new;
         }
     }
-    return { value: bit as (0 | 1), date: date!, isNew: isNew! };
+    catch (err) {
+        console.error();
+        console.error(err);
+    }
+    if (data.value == null) {
+        return null;
+    }
+    return data;
 }
 
-export async function fetchBit(id: bigint): Promise<BitData> {
-    let data: BitData | null = null;
+export async function fetchNibble(id: bigint): Promise<NibbleData> {
+    let data: NibbleData | null = null;
     while (data == null) {
-        data = await tryFetchBit(id);
+        data = await tryFetchNibble(id);
         if (data == null) {
             await sleep(RATE_LIMIT_DURATION);
         }
@@ -130,9 +113,9 @@ export async function fetchBit(id: bigint): Promise<BitData> {
 export async function upload(key: bigint, path: string) {
     const base = key << 32n;
     const file = await Deno.open(path, { read: true });
-    const ones = new Set<number>();
-    const zeroes = new Set<number>();
-    let bitId = 0;
+    const queued = [] as unknown as Record<Nibble, Set<number>>;
+    const done = () => !(queued as unknown as Set<number>[]).some((s) => s.size > 0);
+    let nextNibIdx = 0;
     let wrote = 0;
     let activeDownloads = 0;
     let errors = 0;
@@ -142,98 +125,99 @@ export async function upload(key: bigint, path: string) {
         const timestamp = date.getUTCHours().toString().padStart(2, "0") + ":" +
             date.getUTCMinutes().toString().padStart(2, "0") + ":" +
             date.getUTCSeconds().toString().padStart(2, "0");
-        const text = `\rwrote ${wrote} bits (= ${(wrote/8).toFixed(3)} bytes, ` +
+        const text = `\rwrote ${wrote} nibs (= ${(wrote/2).toFixed(1)} bytes, ` +
             `${activeDownloads} conns, ${errors} errors, ${timestamp}, ` +
-            `bit ${currentBit()}, safe? ${isSafeToWrite() ? "yes": " no"})`
+            `nib ${currentNibble().toString(16).toUpperCase()}, safe? ${isSafeToWrite() ? "yes": " no"})`
         await Deno.stderr.write(new TextEncoder().encode(text));
     };
     const interval = setInterval(intervalCb, 250);
+    for (let i=0; i<16; ++i) {
+        queued[i as Nibble] = new Set();
+    }
+    //FIXME: this is not memory-efficient but realistically it doesn't make
+    //       any sense to use this tool for anything exceeding 1 KiB so whatever
     for await (const chunk of file.readable) {
         for (let i=0; i<chunk.length; ++i) {
             let byte = chunk[i];
-            for (let j=0; j<8; ++j) {
-                if ((byte & 1) === 0) {
-                    zeroes.add(bitId);
-                }
-                else {
-                    ones.add(bitId);
-                }
-                byte >>= 1;
-                ++bitId;
+            for (let j=0; j<2; ++j) {
+                const nibble = (byte & 0xF) as Nibble;
+                queued[nibble].add(nextNibIdx);
+                byte >>= 4;
+                ++nextNibIdx;
             }
         }
-        while (ones.size > 0 || zeroes.size > 0) {
-            const cb = async(): Promise<void> => {
-                await waitUntilSafeWrite();
-                const bit = currentBit();
-                const set = (bit === 1) ? ones : zeroes;
-                if (set.size > 0) {
-                    const bitIndex = set.values().next().value as number;
-                    set.delete(bitIndex);
-                    ++activeDownloads;
-                    const actualBitData = await tryFetchBit(base + BigInt(bitIndex));
-                    if (actualBitData == null) {
-                        set.add(bitIndex);
-                        await sleep(RATE_LIMIT_DURATION);
-                        promises.splice(promises.indexOf(promise), 1);
-                        --activeDownloads;
-                        return;
-                    }
-                    const actualBit = actualBitData.value;
-                    if (actualBit !== bit) {
-                        console.error(`ERROR: for bit ${bitIndex}, tried to write ` +
-                            `${bit} but wrote ${actualBit}`);
-                        ++errors;
-                    }
-                    ++wrote;
-                    --activeDownloads;
-                }
-                else {
-                    await sleep(1000);
-                }
-                promises.splice(promises.indexOf(promise), 1);
-            };
-            const promise = cb();
-            promises.push(promise);
-            if (promises.length >= UPLOAD_CONNECTION_COUNT) {
-                await Promise.any([...promises]);
-            }
-        }
-        await Promise.all([...promises]);
     }
+    while (!done()) {
+        const cb = async(): Promise<void> => {
+            await waitUntilSafeWrite();
+            const nib = currentNibble();
+            const set = queued[nib];
+            if (set.size > 0) {
+                const nibIdx = set.values().next().value as number;
+                set.delete(nibIdx);
+                ++activeDownloads;
+                const actualNibData = await tryFetchNibble(base + BigInt(nibIdx));
+                if (actualNibData == null) {
+                    set.add(nibIdx);
+                    await sleep(RATE_LIMIT_DURATION);
+                    promises.splice(promises.indexOf(promise), 1);
+                    --activeDownloads;
+                    return;
+                }
+                const actualNib = actualNibData.value;
+                if (actualNib !== nib) {
+                    console.error(`ERROR: for nibble ${nibIdx}, tried to write ` +
+                        `${nib.toString(16).toUpperCase()} but wrote ${actualNib.toString(16).toUpperCase()}`);
+                    ++errors;
+                }
+                ++wrote;
+                --activeDownloads;
+            }
+            else {
+                await sleep(1000);
+            }
+            promises.splice(promises.indexOf(promise), 1);
+        };
+        const promise = cb();
+        promises.push(promise);
+        if (promises.length >= UPLOAD_CONNECTION_COUNT) {
+            await Promise.any([...promises]);
+        }
+    }
+    await Promise.all([...promises]);
     clearInterval(interval);
     await intervalCb();
     console.error();
     
     // upload completion timestamp
-    await fetchBit(base-1n);
+    await fetchNibble(base-1n);
 }
 
 export async function download(key: bigint, writable: WritableStream) {
     const base = key << 32n;
     const promises: Promise<void>[] = [];
     const writer = writable.getWriter();
-    let bitCount = 0;
+    let nibCount = 0;
     let lastIndex = Number.MAX_SAFE_INTEGER;
     const intervalCb = async() => {
-        const text = `\rread ${bitCount} bits (= ${(bitCount/8).toFixed(3)} bytes)`
+        const text = `\rread ${nibCount} nibs (= ${(nibCount/2).toFixed(1)} bytes)`
         await Deno.stderr.write(new TextEncoder().encode(text));
     };
     const interval = setInterval(intervalCb, 250);
-    const completionTimestamp = (await fetchBit(base-1n)).date;
+    const completionTimestamp = (await fetchNibble(base-1n)).date;
     const data: number[] = [];
     for (let i=0; i<lastIndex; ++i) {
         const cb = async(): Promise<void> => {
-            const bit = await fetchBit(base + BigInt(i));
-            if (bit.date.valueOf() > completionTimestamp.valueOf() || bit.isNew) {
+            const nibData = await fetchNibble(base + BigInt(i));
+            if (nibData.date.valueOf() > completionTimestamp.valueOf() || nibData.isNew) {
                 lastIndex = Math.min(lastIndex, i);
             }
             else {
-                if (data[Math.floor(i / 8)] == null) {
-                    data[Math.floor(i / 8)] = 0;
+                if (data[Math.floor(i / 2)] == null) {
+                    data[Math.floor(i / 2)] = 0;
                 }
-                data[Math.floor(i / 8)] |= bit.value << (i % 8);
-                ++bitCount;
+                data[Math.floor(i / 2)] |= nibData.value << ((i % 2) * 4);
+                ++nibCount;
                 promises.splice(promises.indexOf(promise), 1);
             }
         };
