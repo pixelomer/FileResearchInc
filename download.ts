@@ -11,7 +11,7 @@ if (path == null || keyStr == null) {
 }
 
 const key = BigInt(`0x${keyStr}`);
-console.error("downloading with key:", key.toString(16));
+console.error("downloading with key:", key.toString(16).toUpperCase());
 const outfile = await Deno.open(path, { write: true, create: true });
 await FileResearchInc.download(key, outfile.writable);
 console.error("download completed:", key.toString(16).toUpperCase());
