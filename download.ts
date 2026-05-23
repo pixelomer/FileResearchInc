@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-net
+#!/usr/bin/env -S deno run --allow-net --allow-read=proxies.txt~,proxies.txt --allow-write=proxies.txt~,proxies.txt --allow-env=FILE_RESEARCH_USE_PROXY
 
 import * as FileResearchInc from "./mod.ts";
 
@@ -15,3 +15,4 @@ console.error("downloading with key:", key.toString(16));
 const outfile = await Deno.open(path, { write: true, create: true });
 await FileResearchInc.download(key, outfile.writable);
 console.error("download completed:", key.toString(16).toUpperCase());
+Deno.exit(0);

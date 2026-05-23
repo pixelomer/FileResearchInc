@@ -1,3 +1,8 @@
+// Proxy support
+const USE_PROXY = Deno.env.get("FILE_RESEARCH_USE_PROXY") === "1";
+const SOCKS5_PROXY_SOURCE = "https://raw.githubusercontent.com/Skillter/" +
+    "ProxyGather/refs/heads/master/proxies/working-proxies-socks5.txt";
+
 // Number of seconds for a nibble window.
 const NIBBLE_WINDOW = 20;
 
@@ -56,6 +61,10 @@ function sleep(ms: number) {
     return new Promise<void>((resolve) => setTimeout(() => resolve(), ms));
 }
 
+function rejectTimeout(ms: number) {
+    return new Promise<void>((_, reject) => setTimeout(() => reject(), ms));
+}
+
 export function isSafeToWrite() {
     return getTime() % NIBBLE_WINDOW <= (NIBBLE_WINDOW - UPLOAD_WINDOW_GAP - 1);
 }
@@ -66,33 +75,139 @@ export async function waitUntilSafeWrite() {
     }
 }
 
-export async function tryFetchNibble(id: bigint): Promise<NibbleData | null> {
-    const data = {} as NibbleData;
+async function checkProxy(client: Deno.HttpClient): Promise<boolean> {
+    const resPromise = fetch("https://github.com", { client });
+    const fail = rejectTimeout(1000);
     try {
-        const res = await fetch("https://numberresearch.xyz/api/check", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ number: id.toString() })
-        });
-        const json = await res.json();
-        if (!res.ok) {
-            if (res.status !== 429) {
-                console.error("\nHTTP", res.status);
-                console.error(json);
+        await Promise.race([resPromise, fail]);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+
+let _ensureProxyPromise: Promise<void> | null = null;
+const _proxyClients: Deno.HttpClient[] = [];
+let _activeProxy = 0;
+function prepareProxyList(): Promise<void> {
+    if (_ensureProxyPromise != null) {
+        return _ensureProxyPromise;
+    }
+    return _ensureProxyPromise = (async()=>{
+        if (!USE_PROXY) {
+            // no need to prepare anything
+            return;
+        }
+
+        try {
+            const savedProxies = await Deno.readTextFile("proxies.txt");
+            const proxies = savedProxies.split("\n").filter((a) => a);
+            for (const url of proxies) {
+                const client = Deno.createHttpClient({
+                    proxy: {
+                        transport: "socks5",
+                        url: "socks5://" + url
+                    }
+                });
+                _proxyClients.push(client);
             }
         }
-        else {
-            data.date = new Date(json.discovered_at);
-            data.value = nibbleForDate(data.date);
-            data.isNew = json.is_new;
+        catch (err) {
+            console.error("Failed to load cached proxies, fetching proxies...")
+            console.error(err);
+            const proxiesRes = await fetch(SOCKS5_PROXY_SOURCE);
+            const proxiesRaw = await proxiesRes.text();
+            const proxies = proxiesRaw.split("\n").map((a)=>a.trim()).filter((a)=>a);
+
+            const proxiesOut = await Deno.open("proxies.txt~", { create: true, append: true });
+            for (const url of proxies) {
+                const client = Deno.createHttpClient({
+                    proxy: {
+                        transport: "socks5",
+                        url: "socks5://" + url
+                    }
+                });
+                Deno.stderr.write(new TextEncoder().encode(`checking ${url} ... `));
+                if (await checkProxy(client)) {
+                    console.error("ok");
+                    await proxiesOut.write(new TextEncoder().encode(url + "\n"));
+                    _proxyClients.push(client);
+                }
+                else {
+                    console.error("bad");
+                }
+            }
+            proxiesOut.close();
+        
+            if (_proxyClients.length <= 0) {
+                console.error("[ERROR] No SOCKS5 proxies available");
+                Deno.exit(1);
+            }
+            await Deno.copyFile("proxies.txt~", "proxies.txt");
+            await Deno.remove("proxies.txt~");
         }
+    })();
+}
+
+export function tryCheckNumber(id: bigint): Promise<Response> {
+    const init: RequestInit & { client?: Deno.HttpClient } = {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ number: id.toString() })
+    };
+    if (USE_PROXY) {
+        init.client = _proxyClients[_activeProxy];
     }
-    catch (err) {
-        console.error();
-        console.error(err);
+    return fetch("https://numberresearch.xyz/api/check", init);
+}
+
+let pickingProxy = false;
+function pickNextProxy() {
+    if (pickingProxy) {
+        return _ensureProxyPromise;
     }
+    pickingProxy = true;
+    _activeProxy = (_activeProxy + 1) % _proxyClients.length;
+    return _ensureProxyPromise = (async()=>{
+        while (!await checkProxy(_proxyClients[_activeProxy])) {
+            _activeProxy = (_activeProxy + 1) % _proxyClients.length;
+        }
+        pickingProxy = false;
+    })();
+}
+
+export async function tryFetchNibble(id: bigint): Promise<NibbleData | null> {
+    const data = {} as NibbleData;
+    do {
+        const activeProxy = _activeProxy;
+        try {
+            const res = await tryCheckNumber(id);
+            const json = await res.json();
+            if (!res.ok) {
+                if (res.status !== 429) {
+                    console.error("\nHTTP", res.status);
+                    console.error(json);
+                }
+            }
+            else {
+                data.date = new Date(json.discovered_at);
+                data.value = nibbleForDate(data.date);
+                data.isNew = json.is_new;
+            }
+        }
+        catch (err) {
+            if (!USE_PROXY) {
+                console.error();
+                console.error(err);
+            }
+        }
+        if (data.value == null && _activeProxy == activeProxy) {
+            await pickNextProxy();
+        }
+    } while (USE_PROXY && data.value == null);
     if (data.value == null) {
         return null;
     }
@@ -111,6 +226,7 @@ export async function fetchNibble(id: bigint): Promise<NibbleData> {
 }
 
 export async function upload(key: bigint, path: string) {
+    await prepareProxyList();
     const base = key << 32n;
     const file = await Deno.open(path, { read: true });
     const queued = [] as unknown as Record<Nibble, Set<number>>;
@@ -166,8 +282,11 @@ export async function upload(key: bigint, path: string) {
                 }
                 const actualNib = actualNibData.value;
                 if (actualNib !== nib) {
+                    console.error();
                     console.error(`ERROR: for nibble ${nibIdx}, tried to write ` +
                         `${nib.toString(16).toUpperCase()} but wrote ${actualNib.toString(16).toUpperCase()}`);
+                    console.error(`       number: ${base + BigInt(nibIdx)}`);
+                    console.error(`       (make sure your system clock is correct)`);
                     ++errors;
                 }
                 ++wrote;
@@ -194,6 +313,7 @@ export async function upload(key: bigint, path: string) {
 }
 
 export async function download(key: bigint, writable: WritableStream) {
+    await prepareProxyList();
     const base = key << 32n;
     const promises: Promise<void>[] = [];
     const writer = writable.getWriter();
