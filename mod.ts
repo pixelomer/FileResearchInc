@@ -1,32 +1,44 @@
 // Proxy support
 const USE_PROXY = Deno.env.get("FILE_RESEARCH_USE_PROXY") === "1";
-const PROXY_URL_SYMBOL = Symbol("PROXY_URL_SYMBOL");
-const PROXY_IN_USE = Symbol("PROXY_IN_USE");
-const SOCKS5_PROXY_LIST_URL = "https://raw.githubusercontent.com/Skillter/" +
-    "ProxyGather/refs/heads/master/proxies/working-proxies-socks5.txt";
+const kProxyURL = Symbol("kProxyURL");
+const kInUse = Symbol("kInUse");
+const proxyListURLs = [
+    {
+        url: "https://api.proxyscrape.com/v4/free-proxy-list/get" +
+            "?request=display_proxies&proxy_format=protocolipport&format=text&protocol=socks5",
+        prepend: ""
+    },
+    {
+        url: "https://raw.githubusercontent.com/Skillter/" +
+            "ProxyGather/refs/heads/master/proxies/working-proxies-socks5.txt",
+        prepend: "socks5://"
+    },
+    {
+        url: "https://raw.githubusercontent.com/roosterkid/" +
+            "openproxylist/refs/heads/main/SOCKS5_RAW.txt",
+        prepend: "socks5://"
+    },
+    {
+        url: "https://raw.githubusercontent.com/roosterkid/" +
+            "openproxylist/refs/heads/main/HTTPS_RAW.txt",
+        prepend: "https://"
+    },
+];
 
-// Number of seconds for a nibble window.
-const NIBBLE_WINDOW = 20;
-
-// Maximum number of connections during upload. Higher number means
-// more nibbles per second, but also higher risk of corruption and
-// rate limit errors.
-const UPLOAD_CONNECTION_COUNT = 8;
+// Maximum number of connections during upload.
+const UPLOAD_CONNECTION_COUNT = 10;
 
 // Maximum number of connections during download.
-const DOWNLOAD_CONNECTION_COUNT = 8;
-
-// Number of seconds to sleep towards the end of each upload window.
-const UPLOAD_WINDOW_GAP = 6;
+const DOWNLOAD_CONNECTION_COUNT = 10;
 
 // Configures the amount of time (in ms) to sleep before continuing after
 // receiving an error response from the server. (Ignored when using proxies)
 const RATE_LIMIT_DURATION = 15000;
 
 export type Nibble = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15;
+export type ProxyClient = Deno.HttpClient & { [kProxyURL]: string, [kInUse]: boolean };
 
-export interface NibbleData {
-    value: Nibble,
+export interface NumberData {
     date: Date,
     isNew: boolean
 };
@@ -51,14 +63,6 @@ export function getTime(date?: Date): number {
     return date.getUTCHours() * 3600 + date.getUTCMinutes() * 60 + date.getUTCSeconds();
 }
 
-export function nibbleForDate(date?: Date): Nibble {
-    return Math.floor((getTime(date) % (NIBBLE_WINDOW * 16)) / NIBBLE_WINDOW) as Nibble;
-}
-
-export function currentNibble(): Nibble {
-    return nibbleForDate(new Date());
-}
-
 function sleep(ms: number) {
     return new Promise<void>((resolve) => setTimeout(() => resolve(), ms));
 }
@@ -67,29 +71,32 @@ function rejectTimeout(ms: number) {
     return new Promise<void>((_, reject) => setTimeout(() => reject(), ms));
 }
 
-export function isSafeToWrite() {
-    return getTime() % NIBBLE_WINDOW <= (NIBBLE_WINDOW - UPLOAD_WINDOW_GAP - 1);
+let elapsedTimerStart = Date.now();
+function resetElapsed() {
+    elapsedTimerStart = Date.now();
 }
 
-export async function waitUntilSafeWrite() {
-    if (isSafeToWrite()) {
-        return false;
-    }
-    while (!isSafeToWrite()) {
-        await sleep(100);
-    }
-    return true;
+function elapsed() {
+    const diff = (Date.now() - elapsedTimerStart) / 1000;
+    return `${Math.floor(diff / 3600).toString().padStart(2, "0")}:` +
+        `${Math.floor((diff / 60) % 60).toString().padStart(2, "0")}:` +
+        `${Math.floor(diff % 60).toString().padStart(2, "0")}`;
 }
 
 async function checkProxy(client: Deno.HttpClient): Promise<boolean> {
-    const resPromise = fetch("https://numberresearch.xyz", { client });
+    const abort = new AbortController();
+    const resPromise = fetch("https://numberresearch.xyz", { client, signal: abort.signal });
     const fail = rejectTimeout(1000);
     try {
         await Promise.race([resPromise, fail]);
+        await Promise.race([(await resPromise).text(), fail]);
         return true;
     }
     catch {
         return false;
+    }
+    finally {
+        abort.abort();
     }
 }
 
@@ -105,13 +112,18 @@ async function fetchLines(url: string) {
 }
 
 async function fetchServerList() {
-    return [...new Set([
-        ...(await fetchLines(SOCKS5_PROXY_LIST_URL)).map((a) => "socks5://" + a)
-    ])];
+    const set = new Set<string>();
+    for (const entry of proxyListURLs) {
+        const list = await fetchLines(entry.url);
+        for (const url of list) {
+            set.add(entry.prepend + url);
+        }
+    }
+    return [...set];
 }
 
 let _ensureProxyPromise: Promise<void> | null = null;
-const _proxyClients: Deno.HttpClient[] = [];
+const _proxyClients: ProxyClient[] = [];
 let _queueFront = 0;
 function prepareProxyList(): Promise<void> {
     if (_ensureProxyPromise != null) {
@@ -132,8 +144,9 @@ function prepareProxyList(): Promise<void> {
                     proxy: {
                         url: url
                     }
-                });
-                (client as any)[PROXY_URL_SYMBOL] = normalizedIP(url);
+                }) as ProxyClient;
+                client[kProxyURL] = normalizedIP(url);
+                client[kInUse] = false;
                 _proxyClients.push(client);
             }
         }
@@ -142,22 +155,28 @@ function prepareProxyList(): Promise<void> {
             console.error(err);
             const serverList = await fetchServerList();
 
+            (await Deno.open("proxies.txt~", { create: true, write: true, truncate: true })).close();
             const proxiesOut = await Deno.open("proxies.txt~", { create: true, append: true });
-            for (const url of serverList) {
-                const client = Deno.createHttpClient({
-                    proxy: {
-                        url: url
+            const connectionCount = Math.min(DOWNLOAD_CONNECTION_COUNT, UPLOAD_CONNECTION_COUNT);
+            for (let i=0; i<serverList.length; i+=connectionCount) {
+                const testList = serverList.slice(i, i+connectionCount);
+                const clients = testList.map((a) => Deno.createHttpClient({
+                    proxy: { url: a }
+                })) as ProxyClient[];
+                const results = await Promise.all(clients.map((a) => checkProxy(a)));
+                for (let i=0; i<results.length; ++i) {
+                    const url = testList[i];
+                    const client = clients[i];
+                    if (results[i]) {
+                        console.error(`[found] ${url}`);
+                        await proxiesOut.write(new TextEncoder().encode(url + "\n"));
+                        client[kProxyURL] = normalizedIP(url);
+                        client[kInUse] = false;
+                        _proxyClients.push(client);
                     }
-                });
-                Deno.stderr.write(new TextEncoder().encode(`checking ${url} ... `));
-                if (await checkProxy(client)) {
-                    console.error("ok");
-                    await proxiesOut.write(new TextEncoder().encode(url + "\n"));
-                    (client as any)[PROXY_URL_SYMBOL] = normalizedIP(url);
-                    _proxyClients.push(client);
-                }
-                else {
-                    console.error("bad");
+                    else {
+                        //console.error("bad");
+                    }
                 }
             }
             proxiesOut.close();
@@ -172,55 +191,52 @@ function prepareProxyList(): Promise<void> {
     })();
 }
 
-export function tryCheckNumber(id: bigint, client?: Deno.HttpClient): Promise<Response> {
-    const init: RequestInit & { client?: Deno.HttpClient } = {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ number: id.toString() }),
-        client: client
-    };
-    return fetch("https://numberresearch.xyz/api/check", init);
-}
-
-let pickingProxy = false;
-let _activePickerPromise: Promise<Deno.HttpClient> | null = null;
-async function pickProxy(oldClient?: Deno.HttpClient) {
+async function pickProxy(oldClient?: ProxyClient): Promise<ProxyClient> {
     if (!USE_PROXY) {
-        return;
-    }
-    while (pickingProxy) {
-        await _activePickerPromise;
+        return undefined as unknown as ProxyClient;
     }
     returnProxy(oldClient);
-    pickingProxy = true;
-    _queueFront = (_queueFront + 1) % _proxyClients.length;
-    _activePickerPromise = (async()=>{
-        while ((_proxyClients[_queueFront] as any)[PROXY_IN_USE] ||
-            !await checkProxy(_proxyClients[_queueFront]))
-        {
+    let viable: boolean;
+    let chosen: number;
+    do {
+        do {
             _queueFront = (_queueFront + 1) % _proxyClients.length;
+        } while (_proxyClients[_queueFront][kInUse]);
+        chosen = _queueFront;
+        _proxyClients[chosen][kInUse] = true;
+        viable = await checkProxy(_proxyClients[chosen]);
+        if (!viable) {
+            _proxyClients[chosen][kInUse] = false;
         }
-        pickingProxy = false;
-        const client = _proxyClients[_queueFront];
-        (client as any)[PROXY_IN_USE] = true;
-        return client;
-    })();
-    return await _activePickerPromise;
+    } while (!viable);
+    const client = _proxyClients[chosen];
+    client[kInUse] = true;
+    return client;
 }
 
-function returnProxy(oldClient?: Deno.HttpClient) {
+function returnProxy(oldClient?: ProxyClient) {
     if (oldClient != null) {
-        (oldClient as any)[PROXY_IN_USE] = false;
+        oldClient[kInUse] = false;
     }
 }
 
-export async function tryFetchNibble(id: bigint, client?: Deno.HttpClient): Promise<NibbleData | null> {
-    const data = {} as NibbleData;
+export async function tryFetchNumber(id: bigint, client?: ProxyClient): Promise<NumberData | null> {
+    const data = {} as NumberData;
+    const abort = new AbortController();
     try {
-        const res = await tryCheckNumber(id, client);
-        const json = await res.json();
+        const init: RequestInit & { client?: Deno.HttpClient } = {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ number: id.toString() }),
+            signal: abort.signal,
+            client: client
+        };
+        const resPromise = fetch("https://numberresearch.xyz/api/check", init);
+        const fail = rejectTimeout(2000);
+        const res = (await Promise.race([resPromise, fail])) as Response;
+        const json = (await Promise.race([res.json(), fail]));
         if (!res.ok) {
             if (res.status !== 429) {
                 console.error("\nHTTP", res.status);
@@ -229,7 +245,6 @@ export async function tryFetchNibble(id: bigint, client?: Deno.HttpClient): Prom
         }
         else {
             data.date = new Date(json.discovered_at);
-            data.value = nibbleForDate(data.date);
             data.isNew = json.is_new;
         }
     }
@@ -239,42 +254,45 @@ export async function tryFetchNibble(id: bigint, client?: Deno.HttpClient): Prom
             console.error(err);
         }
     }
-    if (data.value == null) {
+    finally {
+        abort.abort();
+    }
+    if (data.date == null) {
         return null;
     }
     return data;
 }
 
-export async function fetchNibble(id: bigint): Promise<NibbleData> {
+export async function fetchNumbers(ids: bigint[]): Promise<NumberData[]> {
     let proxy = await pickProxy();
-    let nibble: NibbleData | null;
-    while ((nibble = await tryFetchNibble(id)) == null) {
-        proxy = await pickProxy(proxy);
-        if (!USE_PROXY) await sleep(RATE_LIMIT_DURATION);
+    const numberData: NumberData[] = [];
+    for (let i=0; i<ids.length; ++i) {
+        while ((numberData[i] = (await tryFetchNumber(ids[i]))!) == null) {
+            proxy = await pickProxy(proxy);
+            if (!USE_PROXY) await sleep(RATE_LIMIT_DURATION);
+        }
     }
     returnProxy(proxy);
-    return nibble;
+    return numberData;
+}
+
+export async function fetchNumber(id: bigint): Promise<NumberData> {
+    return (await fetchNumbers([id]))[0];
 }
 
 export async function upload(key: bigint, path: string) {
     await prepareProxyList();
+    resetElapsed();
     const base = key << 32n;
     const file = await Deno.open(path, { read: true });
     const queued = [] as unknown as Record<Nibble, Set<number>>;
-    const done = () => !(queued as unknown as Set<number>[]).some((s) => s.size > 0);
     let nextNibIdx = 0;
     let wrote = 0;
-    let activeDownloads = 0;
-    let errors = 0;
+    let activeConnections = 0;
     const promises: (Promise<void> | null)[] = [];
     const intervalCb = async() => {
-        const date = new Date();
-        const timestamp = date.getUTCHours().toString().padStart(2, "0") + ":" +
-            date.getUTCMinutes().toString().padStart(2, "0") + ":" +
-            date.getUTCSeconds().toString().padStart(2, "0");
         const text = `\rwrote ${wrote} nibs (= ${(wrote/2).toFixed(1)} bytes, ` +
-            `${activeDownloads} conns, ${errors} errors, ${timestamp}, ` +
-            `nib ${currentNibble().toString(16).toUpperCase()}, safe? ${isSafeToWrite() ? "yes": " no"})`
+            `${activeConnections} conns, nib ${currentNibble.toString(16).toUpperCase()}, ${elapsed()})`
         await Deno.stderr.write(new TextEncoder().encode(text));
     };
     const interval = setInterval(intervalCb, 250);
@@ -294,83 +312,76 @@ export async function upload(key: bigint, path: string) {
             }
         }
     }
-    for (let i=0; i<UPLOAD_CONNECTION_COUNT; ++i) {
-        let proxy = await pickProxy();
-        const cb = async(): Promise<void> => {
-            if (await waitUntilSafeWrite()) {
-                proxy = await pickProxy(proxy);
-            }
-            const nib = currentNibble();
-            const set = queued[nib];
-            if (set.size > 0) {
-                const nibIdx = set.values().next().value as number;
-                set.delete(nibIdx);
-                ++activeDownloads;
-                const actualNibData = await tryFetchNibble(base + BigInt(nibIdx), proxy);
-                if (actualNibData == null) {
-                    set.add(nibIdx);
-                    if (USE_PROXY) {
-                        proxy = await pickProxy(proxy);
+    let currentNibble: number;
+    for (currentNibble = 0; currentNibble < 16; ++currentNibble) {
+        await fetchNumber(base + 1n + BigInt(currentNibble));
+        for (let i=0; i<UPLOAD_CONNECTION_COUNT; ++i) {
+            let proxy = await pickProxy();
+            const cb = async(): Promise<void> => {
+                await 0;
+                const set = queued[currentNibble as Nibble];
+                if (set.size > 0) {
+                    const nibIdx = set.values().next().value as number;
+                    set.delete(nibIdx);
+                    ++activeConnections;
+                    const actualNibData = await tryFetchNumber(base + 17n + BigInt(nibIdx), proxy);
+                    if (actualNibData == null) {
+                        set.add(nibIdx);
+                        if (USE_PROXY) {
+                            proxy = await pickProxy(proxy);
+                        }
+                        else {
+                            await sleep(RATE_LIMIT_DURATION);
+                        }
                     }
                     else {
-                        await sleep(RATE_LIMIT_DURATION);
+                        ++wrote;
                     }
+                    --activeConnections;
                     promises[i] = cb();
-                    --activeDownloads;
-                    return;
                 }
-                const actualNib = actualNibData.value;
-                if (actualNib !== nib) {
-                    console.error();
-                    console.error(`ERROR: for nibble ${nibIdx}, tried to write ` +
-                        `${nib.toString(16).toUpperCase()} but wrote ${actualNib.toString(16).toUpperCase()}`);
-                    console.error(`       number: ${base + BigInt(nibIdx)}`);
-                    if (USE_PROXY) {
-                        console.error(`       proxy: ${(proxy as any)[PROXY_URL_SYMBOL]}`);
-                    }
-                    console.error(`       (make sure your system clock is correct)`);
-                    ++errors;
+                else {
+                    promises[i] = null;
+                    returnProxy(proxy);
                 }
-                ++wrote;
-                --activeDownloads;
-            }
-            else {
-                await sleep(1000);
-            }
-            if (!done()) {
-                promises[i] = cb();
-            }
-            else {
-                promises[i] = null;
-                returnProxy(proxy);
-            }
-        };
-        promises.push(cb());
-    }
-    while (promises.some((a) => a != null)) {
-        await Promise.all([...promises]);
+            };
+            promises.push(cb());
+        }
+        while (promises.some((a) => a != null)) {
+            await Promise.all([...promises]);
+        }
+        promises.splice(0);
     }
     clearInterval(interval);
     await intervalCb();
     console.error();
     
     // upload completion timestamp
-    await fetchNibble(base-1n);
+    await fetchNumber(base);
 }
 
 export async function download(key: bigint, writable: WritableStream) {
     await prepareProxyList();
+    resetElapsed();
     const base = key << 32n;
     const promises: (Promise<void> | null)[] = [];
     const writer = writable.getWriter();
     let nibCount = 0;
     let lastIndex = Number.MAX_SAFE_INTEGER;
     const intervalCb = async() => {
-        const text = `\rread ${nibCount} nibs (= ${(nibCount/2).toFixed(1)} bytes)`;
+        const text = `\rread ${nibCount} nibs (= ${(nibCount/2).toFixed(1)} bytes, ${elapsed()})`;
         await Deno.stderr.write(new TextEncoder().encode(text));
     };
     const interval = setInterval(intervalCb, 250);
-    const completionTimestamp = (await fetchNibble(base-1n)).date;
+    const header =
+        (await fetchNumbers(new Array(17).fill(0).map((_,i) => base + BigInt(i))))
+        .map((data) => data.date);
+    const completionTimestamp = header[0];
+    const nibbleTimestamps = header.slice(1, 17);
+    const nibbleForDate = (storedDate: Date) => {
+        const nibble = nibbleTimestamps.findLastIndex((nibbleStart) => storedDate > nibbleStart);
+        return nibble;
+    }
     const data: number[] = [];
     let next = 0;
     const backlog: number[] = [];
@@ -390,14 +401,14 @@ export async function download(key: bigint, writable: WritableStream) {
                 returnProxy(proxy);
                 return;
             }
-            const nibData = await tryFetchNibble(base + BigInt(i), proxy);
-            if (nibData == null) {
+            const numberData = await tryFetchNumber(base + 17n + BigInt(i), proxy);
+            if (numberData == null) {
                 backlog.push(i);
                 proxy = await pickProxy(proxy);
                 promises[worker] = cb();
                 return;
             }
-            if (nibData.date.valueOf() > completionTimestamp.valueOf() || nibData.isNew) {
+            if (numberData.date.valueOf() > completionTimestamp.valueOf() || numberData.isNew) {
                 lastIndex = Math.min(lastIndex, i);
                 promises[worker] = cb();
             }
@@ -405,7 +416,7 @@ export async function download(key: bigint, writable: WritableStream) {
                 if (data[Math.floor(i / 2)] == null) {
                     data[Math.floor(i / 2)] = 0;
                 }
-                data[Math.floor(i / 2)] |= nibData.value << ((i % 2) * 4);
+                data[Math.floor(i / 2)] |= nibbleForDate(numberData.date) << ((i % 2) * 4);
                 ++nibCount;
                 promises[worker] = cb();
             }
